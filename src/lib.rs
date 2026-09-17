@@ -31,6 +31,75 @@ pub async fn read_stream_kind<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u8
     Ok(reader.read_u8().await?)
 }
 
+/// A length-prefixed decoder whose progress survives cancellation of `read`.
+///
+/// Keep one decoder per stream when reading inside `tokio::select!`. The
+/// payload buffer is reused between frames; consume the returned slice before
+/// reading the next frame. A framing or I/O error is terminal for the stream.
+pub struct FrameReader {
+    maximum: usize,
+    header: [u8; 4],
+    header_read: usize,
+    payload: Vec<u8>,
+    payload_read: usize,
+    complete: bool,
+}
+
+impl FrameReader {
+    pub fn new(maximum: usize) -> Self {
+        Self {
+            maximum,
+            header: [0; 4],
+            header_read: 0,
+            payload: Vec::new(),
+            payload_read: 0,
+            complete: false,
+        }
+    }
+
+    pub async fn read<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<&[u8], FrameError> {
+        if self.complete {
+            self.header_read = 0;
+            self.payload_read = 0;
+            self.complete = false;
+        }
+        while self.header_read < self.header.len() {
+            // AsyncReadExt::read is cancellation-safe. Commit every completed
+            // read to this decoder before another await can yield control.
+            let count = reader.read(&mut self.header[self.header_read..]).await?;
+            if count == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            self.header_read += count;
+        }
+        let length = u32::from_be_bytes(self.header) as usize;
+        if length == 0 {
+            return Err(FrameError::Empty);
+        }
+        if length > self.maximum {
+            return Err(FrameError::TooLarge {
+                actual: length,
+                maximum: self.maximum,
+            });
+        }
+        self.payload.resize(length, 0);
+        while self.payload_read < length {
+            let count = reader.read(&mut self.payload[self.payload_read..]).await?;
+            if count == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            self.payload_read += count;
+        }
+        self.complete = true;
+        Ok(&self.payload)
+    }
+}
+
+/// Read one complete frame. Cancellation discards partially consumed bytes;
+/// use a persistent [`FrameReader`] when competing with other futures.
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     maximum: usize,
@@ -86,5 +155,53 @@ mod tests {
             write_frame(&mut writer, b"too large", 4).await,
             Err(FrameError::TooLarge { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn decoder_resumes_after_cancellation_at_every_frame_boundary() {
+        let payload = b"abcdefgh";
+        let mut encoded = (payload.len() as u32).to_be_bytes().to_vec();
+        encoded.extend_from_slice(payload);
+        for boundary in 0..encoded.len() {
+            let (mut writer, mut reader) = tokio::io::duplex(64);
+            let mut decoder = FrameReader::new(32);
+            writer.write_all(&encoded[..boundary]).await.unwrap();
+            tokio::select! {
+                biased;
+                frame = decoder.read(&mut reader) => panic!("incomplete frame: {frame:?}"),
+                _ = std::future::ready(()) => {},
+            }
+            writer.write_all(&encoded[boundary..]).await.unwrap();
+            write_frame(&mut writer, b"next", 32).await.unwrap();
+            assert_eq!(decoder.read(&mut reader).await.unwrap(), payload);
+            assert_eq!(decoder.read(&mut reader).await.unwrap(), b"next");
+        }
+    }
+
+    #[tokio::test]
+    async fn decoder_rejects_limits_before_allocating_and_reports_truncation() {
+        for (length, empty) in [(0_u32, true), (33, false)] {
+            let header = length.to_be_bytes();
+            let mut reader = header.as_slice();
+            let mut decoder = FrameReader::new(32);
+            let error = decoder.read(&mut reader).await.unwrap_err();
+            assert!(if empty {
+                matches!(error, FrameError::Empty)
+            } else {
+                matches!(
+                    error,
+                    FrameError::TooLarge {
+                        actual: 33,
+                        maximum: 32
+                    }
+                )
+            });
+            assert_eq!(decoder.payload.capacity(), 0);
+        }
+        let mut bytes = &b"\0\0\0\x08ab"[..];
+        let error = FrameReader::new(32).read(&mut bytes).await.unwrap_err();
+        assert!(
+            matches!(error, FrameError::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+        );
     }
 }
